@@ -255,6 +255,164 @@ fields that share an analyzer.
 
 ---
 
+## 5A. Multiple-word clauses and the analyzer
+
+This is the most common point of confusion when reasoning about boosts: **a
+boost is attached to a whole clause, never to individual analyzed tokens.** The
+analyzer runs first and decides *how many tokens* a piece of text becomes; the
+boost then multiplies the score of the single Lucene query that those tokens
+were assembled into. So the boost value itself does not "vary" per word — but
+the *number of tokens* the analyzer emits changes how many term scores get
+summed inside the clause, which is what makes the effective, observed score move
+around across analyzers.
+
+### 5A.1 Where the boost lands relative to tokenization
+
+Order of operations for `{"match": {"title": {"query": "quick brown fox", "boost": 2}}}`:
+
+1. The `title` search analyzer tokenizes `"quick brown fox"` → e.g. tokens
+   `[quick, brown, fox]`.
+2. `MatchQuery` builds **one** query out of those tokens (§5) — for the default
+   `BOOLEAN`/`OR` case a `BooleanQuery` with three `SHOULD` `TermQuery` clauses.
+3. `AbstractQueryBuilder.toQuery` wraps that whole `BooleanQuery` in a single
+   `BoostQuery(booleanQuery, 2.0)` (§3).
+
+The `2.0` multiplies the *combined* BooleanQuery score, i.e. it multiplies the
+sum of the per-term BM25 scores — it is **not** applied three times, once per
+word. The same is true of a field boost (`title^2`) and, for `query_string`, a
+`term^boost`. The only difference between those three layers is *which* query
+node gets wrapped, not how the multiplication works.
+
+### 5A.2 How a clause's internal score depends on token count
+
+Because a `BooleanQuery` **sums** its matching `SHOULD`/`MUST` clause scores
+(§6.1), the number of tokens directly changes the base (pre-boost) score:
+
+- More tokens that match → more per-term BM25 scores summed → larger base score
+  → a fixed boost multiplier yields a larger absolute contribution.
+- A single token (e.g. `keyword`) → the clause degenerates to one `TermQuery`,
+  so the boost multiplies exactly one BM25 score.
+- Tokens sharing a position (synonyms, some decompounders) collapse into a
+  `SynonymQuery` for that position rather than adding independent clauses, so
+  they do **not** inflate the sum the way distinct positions do.
+
+Consequence for a boost generator: the *same* `^2` behaves very differently on a
+`keyword` field (doubles one term score) versus an `ngram` field (doubles a sum
+of many overlapping-gram term scores). Budget boost magnitudes per-field with the
+analyzer in mind, not as if every field produced the same number of terms.
+
+### 5A.3 Operator, phrase, and `minimum_should_match` interactions
+
+For a multi-word clause the *combination* of the analyzed tokens is governed by
+`operator` / `type` / `minimum_should_match` **before** the boost is applied:
+
+- `operator: OR` (default) → tokens are `SHOULD`; partial matches score
+  (sum of the matching subset), then boosted.
+- `operator: AND` → tokens are `MUST`; all must match, score is still the sum,
+  then boosted.
+- `type: phrase` → tokens become one `PhraseQuery`; the boost multiplies the
+  single phrase score (position/slop-sensitive), not per token.
+- `minimum_should_match` prunes which `SHOULD` clauses are required but does not
+  change that the boost wraps the final assembled query.
+
+---
+
+## 5B. Analyzer families and their effect on boosting
+
+The boost *syntax* is identical regardless of analyzer (see §5B.4); what changes
+is the token stream the analyzer produces, and therefore the base score the
+boost multiplies. The field's analyzer is resolved per field from the mapping
+(`search_analyzer` for query text, `analyzer` at index time, `search_quote_analyzer`
+for phrases), so different fields in the same `multi_match` can tokenize the same
+input completely differently.
+
+### 5B.1 `keyword` (no real analysis)
+
+The `keyword` analyzer (and the `keyword` field type, which is not analyzed at
+all) emits the **entire input as one token**. `"New York"` → a single term
+`New York`.
+
+- A multi-word query is one `TermQuery`; the boost multiplies one BM25 score.
+- Matching is exact/whole-value — `quick` will not match a `keyword` term
+  `quick brown fox`.
+- `keyword` fields have `norms` off by default (§6), so length normalization is
+  absent; scoring is effectively idf-driven and the boost is close to a plain
+  linear multiplier on a per-term basis.
+- Best when you want a boost to mean "this exact value is worth N×", e.g.
+  `"fields": ["status^5"]` on a `keyword` `status` field.
+
+### 5B.2 Language / stemming analyzers (`english`, `french`, …)
+
+Language analyzers lowercase, remove stop words, and stem. This **reduces and
+normalizes** the token count:
+
+- Stop words are dropped: `"the quick brown fox"` with the `english` analyzer →
+  `[quick, brown, fox]` (the `the` token disappears). Fewer `SHOULD` clauses
+  means the summed base score omits the stop word's contribution before the
+  boost applies — a boost cannot "recover" a removed token.
+- Stemming folds variants to a root: `running`, `runs`, `ran` → `run`, which
+  raises `tf`/`df` behavior and changes idf, indirectly shifting the base score
+  the boost multiplies.
+- The **query-time analyzer must match the index-time analyzer** for the terms
+  to line up; a mismatch can make a boosted clause match nothing.
+- For `cross_fields`, fields you blend should share the analyzer (§4.1) —
+  otherwise the blended statistics and the effect of per-field boosts become
+  inconsistent.
+
+### 5B.3 N-gram / edge-n-gram analyzers
+
+N-gram analyzers explode each word into many overlapping grams, so a short input
+becomes **many tokens**:
+
+- `"quick"` with a 2–3 char n-gram analyzer → `[qu, ui, ic, ck, qui, uic, ick]`.
+- The `BOOLEAN`/`OR` clause is a `BooleanQuery` with one `SHOULD` per gram;
+  scores **sum**. A single boost therefore multiplies a much larger base value,
+  and near-matches (many shared grams) accumulate score even without a full
+  match.
+- This is why an n-gram field often *dominates* a `most_fields` sum unless you
+  **deboost** it (e.g. `"fields": ["title^3", "title.ngram^0.3"]`): its many
+  matching grams already produce a large summed base score.
+- Prefer `best_fields` (dis-max, tie-breaker 0) or a small n-gram field weight
+  when mixing n-gram and analyzed-text fields, so the gram sum does not swamp the
+  exact-match field.
+
+### 5B.4 Syntax is analyzer-independent
+
+The three boost surfaces look the same no matter which analyzer the target field
+uses; only the field you point them at (and thus its analyzer) differs:
+
+```jsonc
+// Query-level boost — multiplies the whole clause, any analyzer
+{ "match": { "title": { "query": "quick brown fox", "boost": 2 } } }
+
+// Field-weight strings (multi_match / query_string / simple_query_string) —
+// mix analyzers across sub-fields and weight them differently
+{ "multi_match": {
+    "query": "quick brown fox",
+    "type":  "most_fields",
+    "fields": [ "title^3",          // language/standard analyzer, strong
+                "title.keyword^5",   // keyword sub-field, exact whole value
+                "title.ngram^0.3" ]  // n-gram sub-field, deboosted
+} }
+
+// Term/phrase boost inside query_string text (classic Lucene grammar only) —
+// still one boost per assembled term/phrase, regardless of analyzer
+{ "query_string": {
+    "default_field": "title",
+    "query": "quick^2 brown \"brown fox\"^1.5"
+} }
+```
+
+Reminders that carry over from §2:
+
+- `simple_query_string` does **not** honor `^` inside the query text; boost its
+  sub-fields through the `fields` array instead.
+- A boost on a `keyword`/exact sub-field multiplies one term score; the same
+  numeric boost on an n-gram sub-field multiplies a sum of many gram scores, so
+  the two are not comparable — tune them independently.
+
+---
+
 ## 6. Scoring: how boosts turn into numbers (BM25)
 
 The default similarity is **BM25**, wired in
